@@ -53,8 +53,9 @@ var (
 	mu sync.Mutex // guards any Jobs change
 
 	// TODO: Background watcher which will make waiting jobs obsolete after some deadline
-	Jobs  map[string]*Job     // all seen jobs in any state
-	Queue map[string]struct{} // queue of job IDs waiting for start
+	Jobs       map[string]*Job       // all seen jobs in any state
+	Queue      map[string]struct{}   // queue of job IDs waiting for start
+	workSignal = make(chan struct{}) // signal for new work
 )
 
 func init() {
@@ -82,26 +83,31 @@ func Run() {
 // --- our evergreen Engine looking for job queue and starting up to MaxPods workers
 
 func Engine() {
-
 	for {
+		select {
+		case <-workSignal: // wait for a signal that a Pod has been released
+			for jobID, _ := range Queue {
+				if RunningPods >= MaxPods {
+					continue // if we have enough Pods running, do not start new ones
+				}
 
-		for jobID, _ := range Queue {
+				mu.Lock()
+				if _, exists := Queue[jobID]; exists {
+					Jobs[jobID].Status = "processing"
+					delete(Queue, jobID)
+					mu.Unlock()
 
-			if RunningPods >= MaxPods {
-				continue
+					atomic.AddInt64(&RunningPods, 1)
+					go func(jID string) {
+						Do(jID) // execute the go routine
+					}(jobID)
+				} else {
+					mu.Unlock() // if the job has been removed from the queue, unlock the mutex
+				}
 			}
-
-			mu.Lock()
-			Jobs[jobID].Status = "processing"
-			delete(Queue, jobID)
-			mu.Unlock()
-
-			atomic.AddInt64(&RunningPods, 1)
-			go Do(jobID)
+		case <-time.After(time.Second): // Timeout sends a signal to check the queue
+			// can be used to check the queue every second
 		}
-
-		// TODO: Some internal sync with channels, not time.Sleep()
-		time.Sleep(1000 * time.Millisecond)
 	}
 }
 
@@ -274,7 +280,7 @@ func Do(jobID string) {
 	//}
 
 	// TODO: Proper logging
-	// fmt.Printf("\n[ PROCESSING ] Finishing job # %s", jobID)
+	fmt.Printf("\n[ PROCESSING ] Finishing job # %s", jobID)
 }
 
 // --- Place new job into queue
@@ -337,7 +343,8 @@ func NewJob(ctx *fiber.Ctx) error {
 	// TODO: Tokenize and check for max tokens
 
 	PlaceJob(payload.ID, payload.Prompt)
-
+	// send a signal to the Engine that a new job has been placed
+	workSignal <- struct{}{}
 	// TODO: Guard with mutex
 	return ctx.JSON(fiber.Map{
 		"id":      payload.ID,
